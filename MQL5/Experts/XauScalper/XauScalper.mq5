@@ -40,11 +40,11 @@ input double          InpTrailStartR    = 0.0;         // Start trailing at R x 
 input double          InpTrailAtrMult   = 1.0;         // Trailing distance = ATR x
 
 input group "Risk"
-input double          InpRiskPct        = 0.25;        // Risk per trade (% of equity)
+input double          InpRiskPct        = 0.15;        // Risk per trade (% of equity), each system
 input double          InpMaxRiskPct     = 2.0;         // Highest risk allowed from Discord (%)
 input double          InpMaxDailyLoss   = 1.5;         // Max daily loss (%) -> stop for the day
-input double          InpMaxDrawdown    = 5.0;         // Max drawdown from peak (%) -> close all, halt
-input int             InpMaxPositions   = 1;           // Max open positions
+input double          InpMaxDrawdown    = 7.0;         // Max drawdown from peak (%) -> close all, halt
+input int             InpMaxPositions   = 1;           // Max open positions per system
 input int             InpMaxTradesDay   = 10;          // Max trades per day
 input int             InpMaxConsecLoss  = 4;           // Losses in a row before cooldown
 input int             InpCooldownMin    = 120;         // Cooldown minutes
@@ -64,17 +64,30 @@ input long            InpMagic          = 260501;      // Magic number
 input int             InpDeviation      = 30;          // Max slippage (points)
 input int             InpRetries        = 3;           // Order retries
 
+input group "Extra breakout systems (each trades on its own, magic + 1 / + 2)"
+input bool            InpSys2On         = true;        // System 2 on
+input ENUM_TIMEFRAMES InpSys2Tf         = PERIOD_M30;  // System 2 timeframe
+input int             InpSys2Bars       = 20;          // System 2 breakout bars
+input bool            InpSys3On         = true;        // System 3 on
+input ENUM_TIMEFRAMES InpSys3Tf         = PERIOD_H1;   // System 3 timeframe
+input int             InpSys3Bars       = 20;          // System 3 breakout bars
+
 input group "Discord bridge"
 input bool            InpUseBridge      = true;        // Talk to the Discord bot
 input string          InpBridgeDir      = "XauScalper"; // Folder under Common\Files
 input int             InpStatusSeconds  = 10;          // Status update interval (seconds)
 
+#define MAX_SYSTEMS 3
+
 CFilters         g_filters;
-CSignal          g_signal;
 CRiskManager     g_risk;
-CTradeExecutor   g_exec;
-CPositionManager g_positions;
-datetime         g_lastEntryBar = 0;
+// One signal, executor and position manager per system; system i trades with magic InpMagic + i.
+CSignal          g_signal[MAX_SYSTEMS];
+CTradeExecutor   g_exec[MAX_SYSTEMS];
+CPositionManager g_positions[MAX_SYSTEMS];
+ENUM_TIMEFRAMES  g_tf[MAX_SYSTEMS];
+datetime         g_lastEntryBar[MAX_SYSTEMS];
+int              g_systems = 0;
 datetime         g_lastStatus = 0;
 string           g_lastBlock = "";
 
@@ -87,39 +100,61 @@ int OnInit()
    if(StringFind(_Symbol, "XAU") < 0 && StringFind(_Symbol, "GOLD") < 0)
       Print("Warning: this EA is tuned for XAUUSD; current symbol is ", _Symbol);
 
-   if(!g_signal.Init(_Symbol, InpTrendTf, InpTrendFastEma, InpTrendSlowEma, InpEntryTf, InpEntryEma,
-                     InpRsiPeriod, InpRsiMid, InpAtrPeriod, InpPullbackBars))
+   // System 1 runs the chosen strategy; systems 2 and 3 are extra breakouts on other timeframes.
+   ENUM_TIMEFRAMES tfs[MAX_SYSTEMS];
+   int bars[MAX_SYSTEMS];
+   g_systems = 0;
+   tfs[g_systems] = InpEntryTf;
+   bars[g_systems++] = InpBreakoutBars;
+   if(InpStrategy == STRATEGY_BREAKOUT && InpSys2On)
      {
-      Print("Failed to create indicators: ", GetLastError());
-      return INIT_FAILED;
+      tfs[g_systems] = InpSys2Tf;
+      bars[g_systems++] = InpSys2Bars;
      }
-   if(InpStrategy == STRATEGY_BREAKOUT)
+   if(InpStrategy == STRATEGY_BREAKOUT && InpSys3On)
      {
-      if(!g_signal.InitBreakout(InpBreakoutBars, InpBreakoutEma, InpDailyEma))
+      tfs[g_systems] = InpSys3Tf;
+      bars[g_systems++] = InpSys3Bars;
+     }
+   for(int i = 0; i < g_systems; i++)
+     {
+      g_tf[i] = tfs[i];
+      g_lastEntryBar[i] = 0;
+      if(!g_signal[i].Init(_Symbol, InpTrendTf, InpTrendFastEma, InpTrendSlowEma, tfs[i], InpEntryEma,
+                           InpRsiPeriod, InpRsiMid, InpAtrPeriod, InpPullbackBars))
         {
-         Print("Failed to create breakout indicators: ", GetLastError());
+         Print("Failed to create indicators: ", GetLastError());
          return INIT_FAILED;
         }
+      if(InpStrategy == STRATEGY_BREAKOUT)
+        {
+         if(!g_signal[i].InitBreakout(bars[i], InpBreakoutEma, InpDailyEma))
+           {
+            Print("Failed to create breakout indicators: ", GetLastError());
+            return INIT_FAILED;
+           }
+        }
+      else
+         g_signal[i].UsePullback();
+      g_exec[i].Init(_Symbol, InpMagic + i, InpDeviation, InpRetries);
+      g_positions[i].Init(_Symbol, InpMagic + i, InpBreakevenAtR, InpTrailStartR, InpTrailAtrMult);
+      PrintFormat("System %d: %s, breakout %d bars, magic %I64d", i + 1, EnumToString(tfs[i]), bars[i], InpMagic + i);
      }
-   else
-      g_signal.UsePullback();
    g_filters.Init(_Symbol, InpMaxSpread, InpSessionStart, InpSessionEnd, InpFridayClose, InpUseNews, InpNewsMinutes, InpNewsCurrency);
    g_risk.Init(_Symbol, InpMagic, InpRiskPct, InpMaxRiskPct, InpMaxDailyLoss, InpMaxDrawdown,
                InpMaxConsecLoss, InpCooldownMin, InpMaxTradesDay);
    g_risk.ApplyInputRisk(InpRiskPct);
    g_risk.SetAutoResumeNewDay(tester && InpTesterResume);
    g_risk.PrintSizingInfo(1.0);
-   g_exec.Init(_Symbol, InpMagic, InpDeviation, InpRetries);
-   g_positions.Init(_Symbol, InpMagic, InpBreakevenAtR, InpTrailStartR, InpTrailAtrMult);
 
    if(!tester)
       EventSetTimer(2);
 
    g_bridge.Event("ea_start", "info",
-                  StringFormat("XauScalper started on %s, account %I64d (%s), state %s, risk %.2f%%",
+                  StringFormat("XauScalper started on %s, account %I64d (%s), state %s, %d system(s), risk %.2f%% per trade",
                                _Symbol, AccountInfoInteger(ACCOUNT_LOGIN),
                                AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "demo" : "REAL",
-                               g_risk.StateName(), g_risk.RiskPct()));
+                               g_risk.StateName(), g_systems, g_risk.RiskPct()));
    WriteStatus();
    return INIT_SUCCEEDED;
   }
@@ -132,32 +167,61 @@ void OnDeinit(const int reason)
       PrintFormat("Backtest: drawdown halt triggered %d time(s).", g_risk.Halts());
    g_bridge.Event("ea_stop", "warning", StringFormat("XauScalper stopped (reason %d). Open positions keep their broker-side SL/TP.", reason),
                   JInt("reason", reason));
-   g_signal.Release();
+   for(int i = 0; i < g_systems; i++)
+      g_signal[i].Release();
+  }
+
+//+------------------------------------------------------------------+
+// System index of a magic number, or -1 when the position is not ours.
+int SystemOf(const long magic)
+  {
+   long i = magic - InpMagic;
+   return (i >= 0 && i < g_systems) ? (int)i : -1;
+  }
+
+int CloseAllSystems()
+  {
+   int n = 0;
+   for(int i = 0; i < g_systems; i++)
+      n += g_exec[i].CloseAll();
+   return n;
+  }
+
+int CountOpenAll()
+  {
+   int n = 0;
+   for(int i = 0; i < g_systems; i++)
+      n += g_exec[i].CountOpen();
+   return n;
   }
 
 //+------------------------------------------------------------------+
 void OnTick()
   {
    if(g_risk.Update())
-      g_exec.CloseAll();
+      CloseAllSystems();
 
-   g_positions.Manage(g_exec.Trade(), g_signal.Atr());
+   for(int i = 0; i < g_systems; i++)
+      g_positions[i].Manage(g_exec[i].Trade(), g_signal[i].Atr());
 
    CloseExpired();
 
-   if(g_filters.IsFridayClose() && g_exec.CountOpen() > 0)
+   if(g_filters.IsFridayClose() && CountOpenAll() > 0)
      {
-      int n = g_exec.CloseAll();
+      int n = CloseAllSystems();
       if(n > 0)
          g_bridge.Event("friday_close", "info", StringFormat("Closed %d position(s) before the weekend.", n));
      }
 
-   // Entries are evaluated once per new entry-timeframe bar.
-   datetime bar = iTime(_Symbol, InpEntryTf, 0);
-   if(bar == 0 || bar == g_lastEntryBar)
-      return;
-   g_lastEntryBar = bar;
-   TryEntry();
+   // Each system evaluates entries once per new bar of its own timeframe.
+   for(int i = 0; i < g_systems; i++)
+     {
+      datetime bar = iTime(_Symbol, g_tf[i], 0);
+      if(bar == 0 || bar == g_lastEntryBar[i])
+         continue;
+      g_lastEntryBar[i] = bar;
+      TryEntry(i);
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -170,11 +234,14 @@ void CloseExpired()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !g_exec.IsOurs(ticket))
+      if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      int sys = SystemOf(PositionGetInteger(POSITION_MAGIC));
+      if(sys < 0)
          continue;
       if(now - (datetime)PositionGetInteger(POSITION_TIME) >= InpMaxHoldHours * 3600)
         {
-         if(g_exec.Close(ticket))
+         if(g_exec[sys].Close(ticket))
             g_bridge.Event("time_exit", "info", StringFormat("Closed #%I64u after %d hours.", ticket, InpMaxHoldHours),
                            JInt("ticket", (long)ticket));
         }
@@ -182,7 +249,7 @@ void CloseExpired()
   }
 
 //+------------------------------------------------------------------+
-void TryEntry()
+void TryEntry(const int sys)
   {
    string reason;
    if(!g_risk.CanOpen(reason))
@@ -190,7 +257,7 @@ void TryEntry()
       NoteBlock(reason);
       return;
      }
-   if(g_exec.CountOpen() >= InpMaxPositions)
+   if(g_exec[sys].CountOpen() >= InpMaxPositions)
       return;
    if(!g_filters.SessionOk())
       return;
@@ -205,11 +272,11 @@ void TryEntry()
       return;
      }
 
-   ENUM_SIGNAL sig = g_signal.Check();
+   ENUM_SIGNAL sig = g_signal[sys].Check();
    if(sig == SIGNAL_NONE)
       return;
 
-   double atr = g_signal.Atr();
+   double atr = g_signal[sys].Atr();
    if(atr <= 0)
       return;
    double stop = atr * InpSlAtrMult;
@@ -223,10 +290,10 @@ void TryEntry()
       return;
      }
 
-   PrintFormat("Entry %s: stop %.2f, %.2f lots, risk %.2f %s (%.2f%%)", sig == SIGNAL_BUY ? "BUY" : "SELL", stop, lots,
+   PrintFormat("System %d entry %s: stop %.2f, %.2f lots, risk %.2f %s (%.2f%%)", sys + 1, sig == SIGNAL_BUY ? "BUY" : "SELL", stop, lots,
                lots * g_risk.LossPerLot(stop), AccountInfoString(ACCOUNT_CURRENCY), g_risk.RiskPct());
    ENUM_ORDER_TYPE type = (sig == SIGNAL_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   ulong ticket = g_exec.Open(type, lots, stop, take, "XauScalper");
+   ulong ticket = g_exec[sys].Open(type, lots, stop, take, StringFormat("XauScalper S%d", sys + 1));
    if(ticket > 0)
      {
       g_risk.OnTradeOpened();
@@ -247,7 +314,7 @@ void NoteBlock(const string reason)
 void OnTimer()
   {
    if(g_risk.Update())
-      g_exec.CloseAll();
+      CloseAllSystems();
    ProcessCommands();
    if(TimeLocal() - g_lastStatus >= InpStatusSeconds)
       WriteStatus();
@@ -260,7 +327,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       return;
    if(!HistoryDealSelect(trans.deal))
       return;
-   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic)
+   int sys = SystemOf(HistoryDealGetInteger(trans.deal, DEAL_MAGIC));
+   if(sys < 0)
       return;
    if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
       return;
@@ -301,7 +369,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
          if(reason == DEAL_REASON_SO)
             why = "STOP OUT";
          g_risk.OnTradeClosed(profit);
-         g_positions.Forget(position);
+         g_positions[sys].Forget(position);
          g_bridge.Event("trade_close", "info",
                         StringFormat("Closed %s %.2f %s @ %.2f (%s) P/L %.2f %s", posSide, volume, _Symbol, price, why, profit,
                                      AccountInfoString(ACCOUNT_CURRENCY)),
@@ -351,11 +419,12 @@ void ProcessCommands()
                if(cmd == "close")
                  {
                   if(arg == "all")
-                     msg = StringFormat("Closed %d position(s).", g_exec.CloseAll());
+                     msg = StringFormat("Closed %d position(s).", CloseAllSystems());
                   else
                     {
                      ulong ticket = (ulong)StringToInteger(arg);
-                     ok = g_exec.Close(ticket);
+                     int sys = PositionSelectByTicket(ticket) ? SystemOf(PositionGetInteger(POSITION_MAGIC)) : -1;
+                     ok = (sys >= 0) && g_exec[sys].Close(ticket);
                      msg = ok ? StringFormat("Closed #%I64u.", ticket) : StringFormat("Could not close #%s (not found or not ours).", arg);
                     }
                  }
@@ -371,7 +440,7 @@ void ProcessCommands()
                      if(cmd == "kill")
                        {
                         g_risk.SetState(EA_HALTED);
-                        int closed = g_exec.CloseAll();
+                        int closed = CloseAllSystems();
                         msg = StringFormat("KILL: closed %d position(s), EA halted. Use /resume to restart.", closed);
                        }
                      else
@@ -397,7 +466,7 @@ void WriteStatus()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || PositionGetInteger(POSITION_MAGIC) != InpMagic || PositionGetString(POSITION_SYMBOL) != _Symbol)
+      if(ticket == 0 || SystemOf(PositionGetInteger(POSITION_MAGIC)) < 0 || PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
       if(positions != "")
          positions += ",";
@@ -431,7 +500,7 @@ void WriteStatus()
                  + JInt("trades_today", g_risk.TradesToday()) + ","
                  + JInt("consec_losses", g_risk.ConsecLosses()) + ","
                  + JInt("spread", g_filters.SpreadPoints()) + ","
-                 + JInt("trend", g_signal.Trend()) + ","
+                 + JInt("trend", g_signal[0].Trend()) + ","
                  + "\"positions\":[" + positions + "]}";
    g_bridge.WriteStatus(json);
   }
