@@ -1,0 +1,415 @@
+//+------------------------------------------------------------------+
+//| XauScalper.mq5                                                   |
+//| Trend-following scalper for XAUUSD with Discord control.         |
+//| Attach to an XAUUSD chart (any timeframe; the EA uses its own    |
+//| timeframes from the inputs).                                     |
+//|                                                                  |
+//| Risk warning: trading leveraged gold/forex can lose more than    |
+//| you expect. Test on a demo account first.                        |
+//+------------------------------------------------------------------+
+#property copyright "XauScalper"
+#property version   "1.00"
+#property description "Trend-following XAUUSD scalper. Risk control in the EA, monitoring via the Discord bot."
+
+#include <XauScalper\Bridge.mqh>
+#include <XauScalper\Filters.mqh>
+#include <XauScalper\Signal.mqh>
+#include <XauScalper\RiskManager.mqh>
+#include <XauScalper\TradeExecutor.mqh>
+#include <XauScalper\PositionManager.mqh>
+
+input group "Strategy"
+input ENUM_TIMEFRAMES InpTrendTf        = PERIOD_M15;  // Trend timeframe
+input int             InpTrendFastEma   = 50;          // Trend fast EMA
+input int             InpTrendSlowEma   = 200;         // Trend slow EMA
+input ENUM_TIMEFRAMES InpEntryTf        = PERIOD_M5;   // Entry timeframe
+input int             InpEntryEma       = 20;          // Entry EMA (pullback level)
+input int             InpRsiPeriod      = 7;           // RSI period
+input double          InpRsiMid         = 50.0;        // RSI trigger level
+input int             InpPullbackBars   = 3;           // Bars to look back for the pullback
+input int             InpAtrPeriod      = 14;          // ATR period (entry timeframe)
+input double          InpSlAtrMult      = 1.5;         // Stop loss = ATR x
+input double          InpTpRMult        = 1.5;         // Take profit = stop distance x
+input double          InpBreakevenAtR   = 0.8;         // Move stop to breakeven at R x
+input double          InpTrailStartR    = 1.0;         // Start trailing at R x
+input double          InpTrailAtrMult   = 1.0;         // Trailing distance = ATR x
+
+input group "Risk"
+input double          InpRiskPct        = 0.5;         // Risk per trade (% of equity)
+input double          InpMaxRiskPct     = 2.0;         // Highest risk allowed from Discord (%)
+input double          InpMaxDailyLoss   = 1.5;         // Max daily loss (%) -> stop for the day
+input double          InpMaxDrawdown    = 5.0;         // Max drawdown from peak (%) -> close all, halt
+input int             InpMaxPositions   = 1;           // Max open positions
+input int             InpMaxTradesDay   = 10;          // Max trades per day
+input int             InpMaxConsecLoss  = 4;           // Losses in a row before cooldown
+input int             InpCooldownMin    = 120;         // Cooldown minutes
+input bool            InpTesterResume   = true;        // Backtest only: resume next day after a drawdown halt
+
+input group "Filters (server time)"
+input int             InpMaxSpread      = 30;          // Max spread (points)
+input int             InpSessionStart   = 10;          // Session start hour
+input int             InpSessionEnd     = 22;          // Session end hour
+input int             InpFridayClose    = 21;          // Friday: close all from this hour
+input bool            InpUseNews        = true;        // Avoid high-impact news
+input int             InpNewsMinutes    = 30;          // Minutes before/after news
+input string          InpNewsCurrency   = "USD";       // News currency
+
+input group "Execution"
+input long            InpMagic          = 260501;      // Magic number
+input int             InpDeviation      = 30;          // Max slippage (points)
+input int             InpRetries        = 3;           // Order retries
+
+input group "Discord bridge"
+input bool            InpUseBridge      = true;        // Talk to the Discord bot
+input string          InpBridgeDir      = "XauScalper"; // Folder under Common\Files
+input int             InpStatusSeconds  = 10;          // Status update interval (seconds)
+
+CFilters         g_filters;
+CSignal          g_signal;
+CRiskManager     g_risk;
+CTradeExecutor   g_exec;
+CPositionManager g_positions;
+datetime         g_lastEntryBar = 0;
+datetime         g_lastStatus = 0;
+string           g_lastBlock = "";
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   bool tester = (bool)MQLInfoInteger(MQL_TESTER);
+   g_bridge.Init(InpUseBridge && !tester, InpBridgeDir);
+
+   if(StringFind(_Symbol, "XAU") < 0 && StringFind(_Symbol, "GOLD") < 0)
+      Print("Warning: this EA is tuned for XAUUSD; current symbol is ", _Symbol);
+
+   if(!g_signal.Init(_Symbol, InpTrendTf, InpTrendFastEma, InpTrendSlowEma, InpEntryTf, InpEntryEma,
+                     InpRsiPeriod, InpRsiMid, InpAtrPeriod, InpPullbackBars))
+     {
+      Print("Failed to create indicators: ", GetLastError());
+      return INIT_FAILED;
+     }
+   g_filters.Init(_Symbol, InpMaxSpread, InpSessionStart, InpSessionEnd, InpFridayClose, InpUseNews, InpNewsMinutes, InpNewsCurrency);
+   g_risk.Init(_Symbol, InpMagic, InpRiskPct, InpMaxRiskPct, InpMaxDailyLoss, InpMaxDrawdown,
+               InpMaxConsecLoss, InpCooldownMin, InpMaxTradesDay);
+   g_risk.ApplyInputRisk(InpRiskPct);
+   g_risk.SetAutoResumeNewDay(tester && InpTesterResume);
+   g_risk.PrintSizingInfo(1.0);
+   g_exec.Init(_Symbol, InpMagic, InpDeviation, InpRetries);
+   g_positions.Init(_Symbol, InpMagic, InpBreakevenAtR, InpTrailStartR, InpTrailAtrMult);
+
+   if(!tester)
+      EventSetTimer(2);
+
+   g_bridge.Event("ea_start", "info",
+                  StringFormat("XauScalper started on %s, account %I64d (%s), state %s, risk %.2f%%",
+                               _Symbol, AccountInfoInteger(ACCOUNT_LOGIN),
+                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "demo" : "REAL",
+                               g_risk.StateName(), g_risk.RiskPct()));
+   WriteStatus();
+   return INIT_SUCCEEDED;
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   if((bool)MQLInfoInteger(MQL_TESTER))
+      PrintFormat("Backtest: drawdown halt triggered %d time(s).", g_risk.Halts());
+   g_bridge.Event("ea_stop", "warning", StringFormat("XauScalper stopped (reason %d). Open positions keep their broker-side SL/TP.", reason),
+                  JInt("reason", reason));
+   g_signal.Release();
+  }
+
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   if(g_risk.Update())
+      g_exec.CloseAll();
+
+   g_positions.Manage(g_exec.Trade(), g_signal.Atr());
+
+   if(g_filters.IsFridayClose() && g_exec.CountOpen() > 0)
+     {
+      int n = g_exec.CloseAll();
+      if(n > 0)
+         g_bridge.Event("friday_close", "info", StringFormat("Closed %d position(s) before the weekend.", n));
+     }
+
+   // Entries are evaluated once per new entry-timeframe bar.
+   datetime bar = iTime(_Symbol, InpEntryTf, 0);
+   if(bar == 0 || bar == g_lastEntryBar)
+      return;
+   g_lastEntryBar = bar;
+   TryEntry();
+  }
+
+//+------------------------------------------------------------------+
+void TryEntry()
+  {
+   string reason;
+   if(!g_risk.CanOpen(reason))
+     {
+      NoteBlock(reason);
+      return;
+     }
+   if(g_exec.CountOpen() >= InpMaxPositions)
+      return;
+   if(!g_filters.SessionOk())
+      return;
+   if(!g_filters.SpreadOk())
+     {
+      NoteBlock(StringFormat("spread %d > %d points", g_filters.SpreadPoints(), InpMaxSpread));
+      return;
+     }
+   if(!g_filters.NewsOk(reason))
+     {
+      NoteBlock(reason);
+      return;
+     }
+
+   ENUM_SIGNAL sig = g_signal.Check();
+   if(sig == SIGNAL_NONE)
+      return;
+
+   double atr = g_signal.Atr();
+   if(atr <= 0)
+      return;
+   double stop = atr * InpSlAtrMult;
+   double take = stop * InpTpRMult;
+   double lots = g_risk.LotsForStop(stop);
+   if(lots <= 0)
+     {
+      g_bridge.Event("skip", "warning",
+                     StringFormat("Signal skipped: minimum lot would risk more than %.2f%% (stop %.2f). Increase balance or lower the ATR multiplier.",
+                                  g_risk.RiskPct(), stop));
+      return;
+     }
+
+   PrintFormat("Entry %s: stop %.2f, %.2f lots, risk %.2f %s (%.2f%%)", sig == SIGNAL_BUY ? "BUY" : "SELL", stop, lots,
+               lots * g_risk.LossPerLot(stop), AccountInfoString(ACCOUNT_CURRENCY), g_risk.RiskPct());
+   ENUM_ORDER_TYPE type = (sig == SIGNAL_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   ulong ticket = g_exec.Open(type, lots, stop, take, "XauScalper");
+   if(ticket > 0)
+     {
+      g_risk.OnTradeOpened();
+      g_lastBlock = "";
+     }
+  }
+
+// Sends a "blocked" note to Discord only when the reason changes, to avoid spam.
+void NoteBlock(const string reason)
+  {
+   if(reason == g_lastBlock)
+      return;
+   g_lastBlock = reason;
+   g_bridge.Event("blocked", "info", "New entries blocked: " + reason);
+  }
+
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   if(g_risk.Update())
+      g_exec.CloseAll();
+   ProcessCommands();
+   if(TimeLocal() - g_lastStatus >= InpStatusSeconds)
+      WriteStatus();
+  }
+
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   if(!HistoryDealSelect(trans.deal))
+      return;
+   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != InpMagic)
+      return;
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+      return;
+
+   long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   long dealType = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+   ulong position = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   double volume = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+   double price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   string side = (dealType == DEAL_TYPE_BUY) ? "BUY" : "SELL";
+
+   if(entry == DEAL_ENTRY_IN)
+     {
+      double sl = 0, tp = 0;
+      if(PositionSelectByTicket(position))
+        {
+         sl = PositionGetDouble(POSITION_SL);
+         tp = PositionGetDouble(POSITION_TP);
+        }
+      g_bridge.Event("trade_open", "info",
+                     StringFormat("%s %.2f %s @ %.2f SL %.2f TP %.2f", side, volume, _Symbol, price, sl, tp),
+                     JInt("ticket", (long)position) + "," + JStr("side", side) + "," + JNum("volume", volume) + ","
+                     + JNum("price", price, _Digits) + "," + JNum("sl", sl, _Digits) + "," + JNum("tp", tp, _Digits));
+     }
+   else
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY)
+        {
+         double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                         + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+         // Closing deal is opposite to the position; report the position's side.
+         string posSide = (dealType == DEAL_TYPE_BUY) ? "SELL" : "BUY";
+         long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
+         string why = "manual/EA";
+         if(reason == DEAL_REASON_SL)
+            why = "SL";
+         if(reason == DEAL_REASON_TP)
+            why = "TP";
+         if(reason == DEAL_REASON_SO)
+            why = "STOP OUT";
+         g_risk.OnTradeClosed(profit);
+         g_positions.Forget(position);
+         g_bridge.Event("trade_close", "info",
+                        StringFormat("Closed %s %.2f %s @ %.2f (%s) P/L %.2f %s", posSide, volume, _Symbol, price, why, profit,
+                                     AccountInfoString(ACCOUNT_CURRENCY)),
+                        JInt("ticket", (long)position) + "," + JStr("side", posSide) + "," + JNum("volume", volume) + ","
+                        + JNum("price", price, _Digits) + "," + JNum("profit", profit) + "," + JStr("reason", why) + ","
+                        + JStr("currency", AccountInfoString(ACCOUNT_CURRENCY)));
+         WriteStatus();
+        }
+  }
+
+//+------------------------------------------------------------------+
+void ProcessCommands()
+  {
+   BridgeCommand cmds[];
+   int n = g_bridge.ReadCommands(cmds);
+   for(int i = 0; i < n; i++)
+     {
+      string msg = "";
+      bool ok = true;
+      string cmd = cmds[i].cmd;
+      string arg = cmds[i].arg;
+
+      if(cmd == "status")
+         msg = "ok";
+      else
+         if(cmd == "pause")
+           {
+            if(g_risk.State() == EA_HALTED)
+              {
+               ok = false;
+               msg = "EA is halted; use /resume";
+              }
+            else
+              {
+               g_risk.SetState(EA_PAUSED);
+               msg = "Paused. Open positions are still managed.";
+              }
+           }
+         else
+            if(cmd == "resume")
+              {
+               bool wasHalted = (g_risk.State() == EA_HALTED);
+               g_risk.Resume();
+               msg = wasHalted ? "Resumed from halt. Equity peak reset to current equity." : "Resumed.";
+              }
+            else
+               if(cmd == "close")
+                 {
+                  if(arg == "all")
+                     msg = StringFormat("Closed %d position(s).", g_exec.CloseAll());
+                  else
+                    {
+                     ulong ticket = (ulong)StringToInteger(arg);
+                     ok = g_exec.Close(ticket);
+                     msg = ok ? StringFormat("Closed #%I64u.", ticket) : StringFormat("Could not close #%s (not found or not ours).", arg);
+                    }
+                 }
+               else
+                  if(cmd == "risk")
+                    {
+                     double pct = StringToDouble(arg);
+                     ok = g_risk.SetRiskPct(pct);
+                     msg = ok ? StringFormat("Risk per trade set to %.2f%%.", pct)
+                           : StringFormat("Risk must be between 0.05 and %.2f%%.", InpMaxRiskPct);
+                    }
+                  else
+                     if(cmd == "kill")
+                       {
+                        g_risk.SetState(EA_HALTED);
+                        int closed = g_exec.CloseAll();
+                        msg = StringFormat("KILL: closed %d position(s), EA halted. Use /resume to restart.", closed);
+                       }
+                     else
+                       {
+                        ok = false;
+                        msg = "Unknown command: " + cmd;
+                       }
+
+      g_bridge.Event("cmd_result", ok ? "info" : "warning", msg,
+                     JStr("id", cmds[i].id) + "," + JStr("cmd", cmd) + "," + JBool("ok", ok));
+      WriteStatus();
+     }
+  }
+
+//+------------------------------------------------------------------+
+void WriteStatus()
+  {
+   g_lastStatus = TimeLocal();
+   if(!g_bridge.Enabled())
+      return;
+
+   string positions = "";
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || PositionGetInteger(POSITION_MAGIC) != InpMagic || PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(positions != "")
+         positions += ",";
+      positions += "{" + JInt("ticket", (long)ticket) + ","
+                   + JStr("side", PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL") + ","
+                   + JNum("volume", PositionGetDouble(POSITION_VOLUME)) + ","
+                   + JNum("open", PositionGetDouble(POSITION_PRICE_OPEN), _Digits) + ","
+                   + JNum("sl", PositionGetDouble(POSITION_SL), _Digits) + ","
+                   + JNum("tp", PositionGetDouble(POSITION_TP), _Digits) + ","
+                   + JNum("profit", PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP)) + "}";
+     }
+
+   string json = "{"
+                 + JInt("ts", (long)TimeGMT()) + ","
+                 + JStr("server_time", TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS)) + ","
+                 + JStr("state", g_risk.StateName()) + ","
+                 + JStr("symbol", _Symbol) + ","
+                 + JInt("login", AccountInfoInteger(ACCOUNT_LOGIN)) + ","
+                 + JBool("demo", AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO) + ","
+                 + JBool("algo_trading", (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && (bool)MQLInfoInteger(MQL_TRADE_ALLOWED)) + ","
+                 + JBool("connected", (bool)TerminalInfoInteger(TERMINAL_CONNECTED)) + ","
+                 + JStr("currency", AccountInfoString(ACCOUNT_CURRENCY)) + ","
+                 + JNum("balance", AccountInfoDouble(ACCOUNT_BALANCE)) + ","
+                 + JNum("equity", AccountInfoDouble(ACCOUNT_EQUITY)) + ","
+                 + JNum("margin_level", AccountInfoDouble(ACCOUNT_MARGIN_LEVEL)) + ","
+                 + JNum("risk_pct", g_risk.RiskPct()) + ","
+                 + JNum("daily_pnl_pct", g_risk.DailyPnlPct()) + ","
+                 + JNum("dd_pct", g_risk.DrawdownPct()) + ","
+                 + JNum("max_dd_pct", InpMaxDrawdown) + ","
+                 + JNum("peak", g_risk.Peak()) + ","
+                 + JInt("trades_today", g_risk.TradesToday()) + ","
+                 + JInt("consec_losses", g_risk.ConsecLosses()) + ","
+                 + JInt("spread", g_filters.SpreadPoints()) + ","
+                 + JInt("trend", g_signal.Trend()) + ","
+                 + "\"positions\":[" + positions + "]}";
+   g_bridge.WriteStatus(json);
+  }
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Optimization score ("Custom max" in the Strategy Tester).        |
+//| Rewards profit factor above 1 and trade count, punishes drawdown.|
+//+------------------------------------------------------------------+
+double OnTester()
+  {
+   double trades = TesterStatistics(STAT_TRADES);
+   double pf = TesterStatistics(STAT_PROFIT_FACTOR);
+   double dd = TesterStatistics(STAT_EQUITY_DDREL_PERCENT);
+   if(trades < 100)
+      return -100;
+   return (pf - 1.0) * MathSqrt(trades) * MathMax(0.0, 1.0 - dd / 50.0);
+  }
+//+------------------------------------------------------------------+
