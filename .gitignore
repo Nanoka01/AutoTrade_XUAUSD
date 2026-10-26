@@ -5,3 +5,4 @@ __pycache__/
 *.ex5
 research/*.pkl
 research/*.csv
+!research/trades_breakout_m15.csv

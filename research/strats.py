@@ -25,8 +25,9 @@ def donchian(tf='15min', n=20, trend=200, slk=2.0, tp=2.0, be=0.0, hours=(9, 22)
     ct = close_time(b, tf)
     h = ct.hour
     ok = (h >= hours[0]) & (h < hours[1])
-    db = daily_bias(ct, dbias)
-    up &= db > 0; dn &= db < 0
+    if dbias > 0:
+        db = daily_bias(ct, dbias)
+        up &= db > 0; dn &= db < 0
     sig = (up | dn) & ok
     s = b[sig]
     return e.run(ct[sig], np.where(up[sig], 1, -1), slk * s.atr.values, tp, be, maxh * 60)
@@ -62,8 +63,9 @@ def pullback(tf='1h', fast=50, slow=200, entry_ema=20, slk=2.0, tp=2.0, be=0.0, 
     dn = dnt & touched_up & (b.close < en) & (b.close < b.low.shift())
     ct = close_time(b, tf); h = ct.hour
     ok = (h >= hours[0]) & (h < hours[1])
-    db = daily_bias(ct, dbias)
-    up &= db > 0; dn &= db < 0
+    if dbias > 0:
+        db = daily_bias(ct, dbias)
+        up &= db > 0; dn &= db < 0
     sig = (up | dn) & ok
     s = b[sig]
     return e.run(ct[sig], np.where(up[sig], 1, -1), slk * s.atr.values, tp, be, maxh * 60)
