@@ -34,7 +34,8 @@ public:
 
    CTrade           *Trade(void) { return GetPointer(m_trade); }
 
-   // stopDistance and takeDistance are in price units. Returns the position ticket, or 0 on failure.
+   // stopDistance and takeDistance are in price units; takeDistance <= 0 opens without a take profit.
+   // Returns the position ticket, or 0 on failure.
    ulong             Open(const ENUM_ORDER_TYPE type, const double lots, const double stopDistance, const double takeDistance,
                           const string comment)
      {
@@ -42,7 +43,7 @@ public:
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
       double minStop = (double)SymbolInfoInteger(m_symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
       double sd = MathMax(stopDistance, minStop + 2 * point);
-      double td = MathMax(takeDistance, minStop + 2 * point);
+      double td = (takeDistance > 0) ? MathMax(takeDistance, minStop + 2 * point) : 0;
 
       for(int attempt = 1; attempt <= m_retries; attempt++)
         {
@@ -56,13 +57,13 @@ public:
          if(type == ORDER_TYPE_BUY)
            {
             double sl = NormalizeDouble(tick.bid - sd, digits);
-            double tp = NormalizeDouble(tick.bid + td, digits);
+            double tp = (td > 0) ? NormalizeDouble(tick.bid + td, digits) : 0;
             ok = m_trade.Buy(lots, m_symbol, tick.ask, sl, tp, comment);
            }
          else
            {
             double sl = NormalizeDouble(tick.ask + sd, digits);
-            double tp = NormalizeDouble(tick.ask - td, digits);
+            double tp = (td > 0) ? NormalizeDouble(tick.ask - td, digits) : 0;
             ok = m_trade.Sell(lots, m_symbol, tick.bid, sl, tp, comment);
            }
          uint code = m_trade.ResultRetcode();

@@ -8,8 +8,8 @@
 //| you expect. Test on a demo account first.                        |
 //+------------------------------------------------------------------+
 #property copyright "XauScalper"
-#property version   "1.00"
-#property description "Trend-following XAUUSD scalper. Risk control in the EA, monitoring via the Discord bot."
+#property version   "2.00"
+#property description "Trend-following XAUUSD EA (M15 breakout + daily trend). Risk control in the EA, monitoring via the Discord bot."
 
 #include <XauScalper\Bridge.mqh>
 #include <XauScalper\Filters.mqh>
@@ -19,23 +19,28 @@
 #include <XauScalper\PositionManager.mqh>
 
 input group "Strategy"
-input ENUM_TIMEFRAMES InpTrendTf        = PERIOD_M15;  // Trend timeframe
-input int             InpTrendFastEma   = 50;          // Trend fast EMA
-input int             InpTrendSlowEma   = 200;         // Trend slow EMA
-input ENUM_TIMEFRAMES InpEntryTf        = PERIOD_M5;   // Entry timeframe
-input int             InpEntryEma       = 20;          // Entry EMA (pullback level)
-input int             InpRsiPeriod      = 7;           // RSI period
-input double          InpRsiMid         = 50.0;        // RSI trigger level
-input int             InpPullbackBars   = 3;           // Bars to look back for the pullback
+input ENUM_STRATEGY   InpStrategy       = STRATEGY_BREAKOUT; // Strategy
+input int             InpBreakoutBars   = 55;          // Breakout: bars for highest high / lowest low
+input int             InpBreakoutEma    = 200;         // Breakout: trend EMA on entry timeframe
+input int             InpDailyEma       = 200;         // Breakout: daily trend EMA
+input int             InpMaxHoldHours   = 72;          // Close a position after this many hours (0 = off)
+input ENUM_TIMEFRAMES InpTrendTf        = PERIOD_M15;  // Pullback: trend timeframe
+input int             InpTrendFastEma   = 50;          // Pullback: trend fast EMA
+input int             InpTrendSlowEma   = 200;         // Pullback: trend slow EMA
+input ENUM_TIMEFRAMES InpEntryTf        = PERIOD_M15;  // Entry timeframe
+input int             InpEntryEma       = 20;          // Pullback: entry EMA
+input int             InpRsiPeriod      = 7;           // Pullback: RSI period
+input double          InpRsiMid         = 50.0;        // Pullback: RSI trigger level
+input int             InpPullbackBars   = 3;           // Pullback: bars to look back
 input int             InpAtrPeriod      = 14;          // ATR period (entry timeframe)
-input double          InpSlAtrMult      = 1.5;         // Stop loss = ATR x
-input double          InpTpRMult        = 1.5;         // Take profit = stop distance x
-input double          InpBreakevenAtR   = 0.8;         // Move stop to breakeven at R x
-input double          InpTrailStartR    = 1.0;         // Start trailing at R x
+input double          InpSlAtrMult      = 3.0;         // Stop loss = ATR x
+input double          InpTpRMult        = 0.0;         // Take profit = stop distance x (0 = none)
+input double          InpBreakevenAtR   = 0.0;         // Move stop to breakeven at R x (0 = off)
+input double          InpTrailStartR    = 0.0;         // Start trailing at R x (0 = off)
 input double          InpTrailAtrMult   = 1.0;         // Trailing distance = ATR x
 
 input group "Risk"
-input double          InpRiskPct        = 0.5;         // Risk per trade (% of equity)
+input double          InpRiskPct        = 0.25;        // Risk per trade (% of equity)
 input double          InpMaxRiskPct     = 2.0;         // Highest risk allowed from Discord (%)
 input double          InpMaxDailyLoss   = 1.5;         // Max daily loss (%) -> stop for the day
 input double          InpMaxDrawdown    = 5.0;         // Max drawdown from peak (%) -> close all, halt
@@ -46,10 +51,10 @@ input int             InpCooldownMin    = 120;         // Cooldown minutes
 input bool            InpTesterResume   = true;        // Backtest only: resume next day after a drawdown halt
 
 input group "Filters (server time)"
-input int             InpMaxSpread      = 30;          // Max spread (points)
-input int             InpSessionStart   = 10;          // Session start hour
-input int             InpSessionEnd     = 22;          // Session end hour
-input int             InpFridayClose    = 21;          // Friday: close all from this hour
+input int             InpMaxSpread      = 60;          // Max spread (points)
+input int             InpSessionStart   = 0;           // Session start hour
+input int             InpSessionEnd     = 24;          // Session end hour
+input int             InpFridayClose    = 20;          // Friday: close all from this hour
 input bool            InpUseNews        = true;        // Avoid high-impact news
 input int             InpNewsMinutes    = 30;          // Minutes before/after news
 input string          InpNewsCurrency   = "USD";       // News currency
@@ -88,6 +93,16 @@ int OnInit()
       Print("Failed to create indicators: ", GetLastError());
       return INIT_FAILED;
      }
+   if(InpStrategy == STRATEGY_BREAKOUT)
+     {
+      if(!g_signal.InitBreakout(InpBreakoutBars, InpBreakoutEma, InpDailyEma))
+        {
+         Print("Failed to create breakout indicators: ", GetLastError());
+         return INIT_FAILED;
+        }
+     }
+   else
+      g_signal.UsePullback();
    g_filters.Init(_Symbol, InpMaxSpread, InpSessionStart, InpSessionEnd, InpFridayClose, InpUseNews, InpNewsMinutes, InpNewsCurrency);
    g_risk.Init(_Symbol, InpMagic, InpRiskPct, InpMaxRiskPct, InpMaxDailyLoss, InpMaxDrawdown,
                InpMaxConsecLoss, InpCooldownMin, InpMaxTradesDay);
@@ -128,6 +143,8 @@ void OnTick()
 
    g_positions.Manage(g_exec.Trade(), g_signal.Atr());
 
+   CloseExpired();
+
    if(g_filters.IsFridayClose() && g_exec.CountOpen() > 0)
      {
       int n = g_exec.CloseAll();
@@ -141,6 +158,27 @@ void OnTick()
       return;
    g_lastEntryBar = bar;
    TryEntry();
+  }
+
+//+------------------------------------------------------------------+
+// Closes positions held longer than InpMaxHoldHours.
+void CloseExpired()
+  {
+   if(InpMaxHoldHours <= 0)
+      return;
+   datetime now = TimeCurrent();
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !g_exec.IsOurs(ticket))
+         continue;
+      if(now - (datetime)PositionGetInteger(POSITION_TIME) >= InpMaxHoldHours * 3600)
+        {
+         if(g_exec.Close(ticket))
+            g_bridge.Event("time_exit", "info", StringFormat("Closed #%I64u after %d hours.", ticket, InpMaxHoldHours),
+                           JInt("ticket", (long)ticket));
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -175,7 +213,7 @@ void TryEntry()
    if(atr <= 0)
       return;
    double stop = atr * InpSlAtrMult;
-   double take = stop * InpTpRMult;
+   double take = (InpTpRMult > 0) ? stop * InpTpRMult : 0;
    double lots = g_risk.LotsForStop(stop);
    if(lots <= 0)
      {

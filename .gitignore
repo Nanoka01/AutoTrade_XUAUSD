@@ -3,3 +3,5 @@ bot/trades.db
 bot/.venv/
 __pycache__/
 *.ex5
+research/*.pkl
+research/*.csv

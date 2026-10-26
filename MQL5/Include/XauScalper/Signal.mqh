@@ -7,8 +7,19 @@
 //|     bars touched the entry EMA.                                  |
 //|  3. Trigger: the last closed bar closed back beyond the entry    |
 //|     EMA and RSI crossed the mid level in the trend direction.    |
+//| Breakout mode (default):                                         |
+//|  1. Daily bias: yesterday's D1 close above its EMA (mirror).     |
+//|  2. Entry-timeframe trend: last closed bar beyond its EMA.       |
+//|  3. Trigger: last closed bar closed beyond the highest high      |
+//|     (lowest low) of the N bars before it.                        |
 //| Only closed bars are used, so a signal never repaints.           |
 //+------------------------------------------------------------------+
+
+enum ENUM_STRATEGY
+  {
+   STRATEGY_BREAKOUT = 0,   // Breakout + daily trend
+   STRATEGY_PULLBACK = 1    // EMA pullback (old)
+  };
 
 enum ENUM_SIGNAL
   {
@@ -30,6 +41,10 @@ private:
    int               m_hEntryEma;
    int               m_hRsi;
    int               m_hAtr;
+   ENUM_STRATEGY     m_mode;
+   int               m_breakoutBars;
+   int               m_hBreakEma;
+   int               m_hDailyEma;
 
    bool              Copy(const int handle, const int count, double &buf[]) const
      {
@@ -39,7 +54,8 @@ private:
 
 public:
                      CSignal(void) : m_hTrendFast(INVALID_HANDLE), m_hTrendSlow(INVALID_HANDLE), m_hEntryEma(INVALID_HANDLE),
-                     m_hRsi(INVALID_HANDLE), m_hAtr(INVALID_HANDLE) {}
+                     m_hRsi(INVALID_HANDLE), m_hAtr(INVALID_HANDLE), m_mode(STRATEGY_BREAKOUT), m_breakoutBars(55),
+                     m_hBreakEma(INVALID_HANDLE), m_hDailyEma(INVALID_HANDLE) {}
 
    bool              Init(const string symbol, const ENUM_TIMEFRAMES trendTf, const int fastEma, const int slowEma,
                           const ENUM_TIMEFRAMES entryTf, const int entryEma, const int rsiPeriod, const double rsiMid,
@@ -59,6 +75,18 @@ public:
              && m_hRsi != INVALID_HANDLE && m_hAtr != INVALID_HANDLE;
      }
 
+   // Call after Init to switch to breakout mode.
+   bool              InitBreakout(const int breakoutBars, const int breakEma, const int dailyEma)
+     {
+      m_mode = STRATEGY_BREAKOUT;
+      m_breakoutBars = MathMax(2, breakoutBars);
+      m_hBreakEma = iMA(m_symbol, m_entryTf, breakEma, 0, MODE_EMA, PRICE_CLOSE);
+      m_hDailyEma = iMA(m_symbol, PERIOD_D1, dailyEma, 0, MODE_EMA, PRICE_CLOSE);
+      return m_hBreakEma != INVALID_HANDLE && m_hDailyEma != INVALID_HANDLE;
+     }
+
+   void              UsePullback(void) { m_mode = STRATEGY_PULLBACK; }
+
    void              Release(void)
      {
       if(m_hTrendFast != INVALID_HANDLE) IndicatorRelease(m_hTrendFast);
@@ -66,6 +94,8 @@ public:
       if(m_hEntryEma != INVALID_HANDLE)  IndicatorRelease(m_hEntryEma);
       if(m_hRsi != INVALID_HANDLE)       IndicatorRelease(m_hRsi);
       if(m_hAtr != INVALID_HANDLE)       IndicatorRelease(m_hAtr);
+      if(m_hBreakEma != INVALID_HANDLE)  IndicatorRelease(m_hBreakEma);
+      if(m_hDailyEma != INVALID_HANDLE)  IndicatorRelease(m_hDailyEma);
      }
 
    // ATR of the last closed entry bar, in price units. 0 when data is not ready.
@@ -77,9 +107,23 @@ public:
       return atr[1];
      }
 
+   // Daily bias: +1 when yesterday's close is above the daily EMA, -1 below, 0 when data is not ready.
+   int               DailyBias(void) const
+     {
+      double ema[];
+      if(!Copy(m_hDailyEma, 2, ema))
+         return 0;
+      double close1 = iClose(m_symbol, PERIOD_D1, 1);
+      if(close1 <= 0)
+         return 0;
+      return close1 > ema[1] ? 1 : (close1 < ema[1] ? -1 : 0);
+     }
+
    // +1 uptrend, -1 downtrend, 0 no clear trend.
    int               Trend(void) const
      {
+      if(m_mode == STRATEGY_BREAKOUT)
+         return DailyBias();
       double fast[], slow[];
       if(!Copy(m_hTrendFast, 2, fast) || !Copy(m_hTrendSlow, 2, slow))
          return 0;
@@ -91,8 +135,37 @@ public:
       return 0;
      }
 
+   ENUM_SIGNAL       CheckBreakout(void) const
+     {
+      int bias = DailyBias();
+      if(bias == 0)
+         return SIGNAL_NONE;
+      double ema[];
+      if(!Copy(m_hBreakEma, 2, ema))
+         return SIGNAL_NONE;
+      int need = m_breakoutBars + 2;
+      MqlRates rates[];
+      ArraySetAsSeries(rates, true);
+      if(CopyRates(m_symbol, m_entryTf, 0, need, rates) != need)
+         return SIGNAL_NONE;
+      double hh = rates[2].high, ll = rates[2].low;
+      for(int i = 3; i <= m_breakoutBars + 1; i++)
+        {
+         hh = MathMax(hh, rates[i].high);
+         ll = MathMin(ll, rates[i].low);
+        }
+      double c = rates[1].close;
+      if(bias > 0 && c > hh && c > ema[1])
+         return SIGNAL_BUY;
+      if(bias < 0 && c < ll && c < ema[1])
+         return SIGNAL_SELL;
+      return SIGNAL_NONE;
+     }
+
    ENUM_SIGNAL       Check(void) const
      {
+      if(m_mode == STRATEGY_BREAKOUT)
+         return CheckBreakout();
       int trend = Trend();
       if(trend == 0)
          return SIGNAL_NONE;

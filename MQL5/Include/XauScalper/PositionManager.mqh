@@ -83,8 +83,8 @@ public:
          double moved = isBuy ? price - open : open - price;
          double newSl = sl;
 
-         // Breakeven: lock the entry plus the current spread once price has moved enough.
-         if(moved >= m_breakevenAtR * r)
+         // Breakeven (0 = off): lock the entry plus the current spread once price has moved enough.
+         if(m_breakevenAtR > 0 && moved >= m_breakevenAtR * r)
            {
             double spread = tick.ask - tick.bid;
             double be = isBuy ? open + spread : open - spread;
@@ -94,8 +94,8 @@ public:
                newSl = be;
            }
 
-         // ATR trailing stop.
-         if(atr > 0 && moved >= m_trailStartR * r)
+         // ATR trailing stop (start 0 = off).
+         if(atr > 0 && m_trailStartR > 0 && moved >= m_trailStartR * r)
            {
             double trail = isBuy ? price - m_trailAtrMult * atr : price + m_trailAtrMult * atr;
             if(isBuy && trail > newSl)

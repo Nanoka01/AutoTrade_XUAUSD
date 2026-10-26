@@ -1,6 +1,6 @@
 # XauScalper: EA เทรด XAUUSD + Discord bot
 
-ระบบ scalping ทองคำแบบ Trend-following บน MetaTrader 5 พร้อม Discord bot สำหรับดูสถานะ สั่งหยุด และรับแจ้งเตือน
+ระบบเทรดทองคำแบบ Trend-following (breakout บน M15 ตามเทรนด์รายวัน) บน MetaTrader 5 พร้อม Discord bot สำหรับดูสถานะ สั่งหยุด และรับแจ้งเตือน
 
 > **คำเตือน:** การเทรดทองคำด้วย leverage มีความเสี่ยงสูง อาจขาดทุนเร็วกว่าที่คาด ผล backtest และบัญชีทดลองไม่รับประกันผลบัญชีจริง ใช้บัญชี Demo จนกว่าระบบจะนิ่ง และใช้เฉพาะเงินที่เสียได้
 
@@ -10,16 +10,18 @@
 
 | ส่วน | ไฟล์ | ทำอะไร |
 | --- | --- | --- |
-| EA หลัก | `MQL5/Experts/XauScalper/XauScalper.mq5` | รวมทุกโมดูล ตัดสินใจเข้าไม้ทุกแท่ง M5 ใหม่ |
-| สัญญาณ | `MQL5/Include/XauScalper/Signal.mqh` | เทรนด์จาก EMA 50/200 บน M15, เข้าเมื่อย่อตัวแตะ EMA 20 บน M5 แล้ว RSI(7) ตัด 50 กลับตามเทรนด์ |
-| ความเสี่ยง | `RiskManager.mqh` | คำนวณ lot จาก % ความเสี่ยง, ขาดทุนต่อวัน 1.5%, **drawdown สูงสุด 5% → ปิดทุกไม้และหยุด**, แพ้ติด 4 ไม้พัก 2 ชม., สูงสุด 10 ไม้/วัน |
-| ฟิลเตอร์ | `Filters.mqh` | spread ไม่เกิน 30 points, เทรดเฉพาะ 10:00–22:00 เวลา server, เลี่ยงข่าวแรงของ USD ±30 นาที, ปิดทุกไม้วันศุกร์ 21:00 |
+| EA หลัก | `MQL5/Experts/XauScalper/XauScalper.mq5` | รวมทุกโมดูล ตัดสินใจเข้าไม้ทุกแท่ง M15 ใหม่ |
+| สัญญาณ | `MQL5/Include/XauScalper/Signal.mqh` | เทรดตามเทรนด์รายวัน (ราคาปิดเมื่อวานเทียบ EMA 200 บน D1) เข้าเมื่อแท่ง M15 ปิดทะลุจุดสูงสุด/ต่ำสุดของ 55 แท่งก่อนหน้า และอยู่ฝั่งเดียวกับ EMA 200 บน M15 (โหมด pullback แบบเดิมยังเลือกได้ใน Inputs) |
+| ความเสี่ยง | `RiskManager.mqh` | คำนวณ lot จาก % ความเสี่ยง (ค่าเริ่มต้น 0.25%/ไม้), ขาดทุนต่อวัน 1.5%, **drawdown สูงสุด 5% → ปิดทุกไม้และหยุด**, แพ้ติด 4 ไม้พัก 2 ชม., สูงสุด 10 ไม้/วัน |
+| ฟิลเตอร์ | `Filters.mqh` | spread ไม่เกิน 60 points, เลี่ยงข่าวแรงของ USD ±30 นาที, ปิดทุกไม้วันศุกร์ 20:00 เวลา server |
 | ส่งออเดอร์ | `TradeExecutor.mqh` | ส่งออเดอร์พร้อม SL/TP ฝั่งโบรกเกอร์ทุกครั้ง, retry เมื่อ requote |
-| ดูแลไม้ | `PositionManager.mqh` | เลื่อน SL ไปจุดทุนที่ 0.8R, trailing stop ตาม ATR หลัง 1R |
+| ดูแลไม้ | `PositionManager.mqh` | ปิดไม้ที่ถือเกิน 72 ชม. (breakeven และ trailing stop มีให้เปิดใช้ แต่ค่าเริ่มต้นปิดไว้) |
 | ตัวเชื่อม | `Bridge.mqh` + `bot/bridge.py` | EA กับ bot คุยกันผ่านไฟล์ในโฟลเดอร์ Common\Files ของ MT5 |
 | Discord bot | `bot/main.py` | คำสั่ง `/status` `/positions` `/report` `/pause` `/resume` `/close` `/risk` `/kill`, แจ้งเตือนเปิด/ปิดไม้, เตือนเมื่อ EA เงียบเกิน 2 นาที, สรุปรายวัน 23:00 |
 
-SL = ATR(14) × 1.5, TP = 1.5 เท่าของ SL ค่าทั้งหมดปรับได้ในหน้าต่าง Inputs ของ EA
+SL = ATR(14) บน M15 × 3, ไม่มี TP (ปล่อยกำไรวิ่งจนโดน SL, ครบ 72 ชม. หรือวันศุกร์ 20:00) ค่าทั้งหมดปรับได้ในหน้าต่าง Inputs ของ EA
+
+ผลทดสอบใน Python ด้วยข้อมูล M1 ของ MetaQuotes-Demo (ความเสี่ยง 0.25%/ไม้, คิด spread ขั้นต่ำ ~0.36 USD): ปี 2023–2025 PF 1.58, drawdown 4.4%; ปี 2026 ที่ไม่ได้ใช้จูน PF 1.61, +8.5%, drawdown 3.5% กำไรส่วนใหญ่ของปี 2026 มาจากเดือนมกราคม ผลในอดีตไม่รับประกันอนาคต
 
 ---
 
@@ -44,7 +46,7 @@ SL = ATR(14) × 1.5, TP = 1.5 เท่าของ SL ค่าทั้งห�
 ### 3. Backtest ก่อน
 
 1. ใน MT5 กด Ctrl+R เปิด Strategy Tester
-2. Expert: `XauScalper`, Symbol: XAUUSD, Timeframe: M5
+2. Expert: `XauScalper`, Symbol: XAUUSD, Timeframe: M15
 3. Modelling: **Every tick based on real ticks**, ช่วงเวลา 2–3 ปีล่าสุด, Deposit เท่าทุนที่ตั้งใจใช้
 4. กด Start แล้วดูแท็บ Backtest: Profit Factor, Maximal drawdown, Total trades
 5. ส่งภาพหน้าจอผลมาให้ผมดู เราจะปรับค่าด้วยกันก่อนรันบน Demo
