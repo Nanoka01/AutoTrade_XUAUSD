@@ -14,6 +14,7 @@
 #include <XauScalper\Bridge.mqh>
 #include <XauScalper\Filters.mqh>
 #include <XauScalper\Signal.mqh>
+#include <XauScalper\AsianRange.mqh>
 #include <XauScalper\RiskManager.mqh>
 #include <XauScalper\TradeExecutor.mqh>
 #include <XauScalper\PositionManager.mqh>
@@ -43,7 +44,7 @@ input group "Risk"
 input double          InpRiskPct        = 0.15;        // Risk per trade (% of equity), each system
 input double          InpMaxRiskPct     = 2.0;         // Highest risk allowed from Discord (%)
 input double          InpMaxDailyLoss   = 1.5;         // Max daily loss (%) -> stop for the day
-input double          InpMaxDrawdown    = 7.0;         // Max drawdown from peak (%) -> close all, halt
+input double          InpMaxDrawdown    = 8.0;         // Max drawdown from peak (%) -> close all, halt
 input int             InpMaxPositions   = 1;           // Max open positions per system
 input int             InpMaxTradesDay   = 10;          // Max trades per day
 input int             InpMaxConsecLoss  = 4;           // Losses in a row before cooldown
@@ -72,12 +73,22 @@ input bool            InpSys3On         = true;        // System 3 on
 input ENUM_TIMEFRAMES InpSys3Tf         = PERIOD_H1;   // System 3 timeframe
 input int             InpSys3Bars       = 20;          // System 3 breakout bars
 
+input group "System 4: Asian range breakout (magic + 3)"
+input bool            InpSys4On         = true;        // System 4 on
+input int             InpOrbStartHour   = 1;           // Range start hour (server)
+input int             InpOrbEndHour     = 8;           // Range end hour (server)
+input int             InpOrbLastEntry   = 20;          // No new entries from this hour
+input double          InpOrbSlMult      = 1.0;         // Stop loss = range width x
+input double          InpOrbTpR         = 3.0;         // Take profit = stop x
+input int             InpOrbMaxHold     = 12;          // Close after this many hours
+input int             InpOrbDailyEma    = 50;          // Daily trend EMA
+
 input group "Discord bridge"
 input bool            InpUseBridge      = true;        // Talk to the Discord bot
 input string          InpBridgeDir      = "XauScalper"; // Folder under Common\Files
 input int             InpStatusSeconds  = 10;          // Status update interval (seconds)
 
-#define MAX_SYSTEMS 3
+#define MAX_SYSTEMS 4
 
 CFilters         g_filters;
 CRiskManager     g_risk;
@@ -88,6 +99,8 @@ CPositionManager g_positions[MAX_SYSTEMS];
 ENUM_TIMEFRAMES  g_tf[MAX_SYSTEMS];
 datetime         g_lastEntryBar[MAX_SYSTEMS];
 int              g_systems = 0;
+int              g_orbIdx = -1;        // index of the Asian range system, -1 when off
+CAsianRange      g_orb;
 datetime         g_lastStatus = 0;
 string           g_lastBlock = "";
 
@@ -140,6 +153,22 @@ int OnInit()
       g_positions[i].Init(_Symbol, InpMagic + i, InpBreakevenAtR, InpTrailStartR, InpTrailAtrMult);
       PrintFormat("System %d: %s, breakout %d bars, magic %I64d", i + 1, EnumToString(tfs[i]), bars[i], InpMagic + i);
      }
+   g_orbIdx = -1;
+   if(InpStrategy == STRATEGY_BREAKOUT && InpSys4On)
+     {
+      if(!g_orb.Init(_Symbol, InpOrbStartHour, InpOrbEndHour, InpOrbLastEntry, InpOrbSlMult, InpOrbDailyEma))
+        {
+         Print("Failed to create Asian range indicators: ", GetLastError());
+         return INIT_FAILED;
+        }
+      g_orbIdx = g_systems++;
+      g_tf[g_orbIdx] = PERIOD_M5;
+      g_lastEntryBar[g_orbIdx] = 0;
+      g_exec[g_orbIdx].Init(_Symbol, InpMagic + g_orbIdx, InpDeviation, InpRetries);
+      g_positions[g_orbIdx].Init(_Symbol, InpMagic + g_orbIdx, InpBreakevenAtR, InpTrailStartR, InpTrailAtrMult);
+      PrintFormat("System %d: Asian range %02d-%02d, entries until %02d:00, magic %I64d", g_orbIdx + 1, InpOrbStartHour,
+                  InpOrbEndHour, InpOrbLastEntry, InpMagic + g_orbIdx);
+     }
    g_filters.Init(_Symbol, InpMaxSpread, InpSessionStart, InpSessionEnd, InpFridayClose, InpUseNews, InpNewsMinutes, InpNewsCurrency);
    g_risk.Init(_Symbol, InpMagic, InpRiskPct, InpMaxRiskPct, InpMaxDailyLoss, InpMaxDrawdown,
                InpMaxConsecLoss, InpCooldownMin, InpMaxTradesDay);
@@ -168,8 +197,13 @@ void OnDeinit(const int reason)
    g_bridge.Event("ea_stop", "warning", StringFormat("XauScalper stopped (reason %d). Open positions keep their broker-side SL/TP.", reason),
                   JInt("reason", reason));
    for(int i = 0; i < g_systems; i++)
-      g_signal[i].Release();
+      if(i != g_orbIdx)
+         g_signal[i].Release();
+   g_orb.Release();
   }
+
+double SystemAtr(const int sys) { return sys == g_orbIdx ? 0 : g_signal[sys].Atr(); }
+int    SystemHoldHours(const int sys) { return sys == g_orbIdx ? InpOrbMaxHold : InpMaxHoldHours; }
 
 //+------------------------------------------------------------------+
 // System index of a magic number, or -1 when the position is not ours.
@@ -202,7 +236,7 @@ void OnTick()
       CloseAllSystems();
 
    for(int i = 0; i < g_systems; i++)
-      g_positions[i].Manage(g_exec[i].Trade(), g_signal[i].Atr());
+      g_positions[i].Manage(g_exec[i].Trade(), SystemAtr(i));
 
    CloseExpired();
 
@@ -228,8 +262,6 @@ void OnTick()
 // Closes positions held longer than InpMaxHoldHours.
 void CloseExpired()
   {
-   if(InpMaxHoldHours <= 0)
-      return;
    datetime now = TimeCurrent();
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
@@ -239,10 +271,11 @@ void CloseExpired()
       int sys = SystemOf(PositionGetInteger(POSITION_MAGIC));
       if(sys < 0)
          continue;
-      if(now - (datetime)PositionGetInteger(POSITION_TIME) >= InpMaxHoldHours * 3600)
+      int hold = SystemHoldHours(sys);
+      if(hold > 0 && now - (datetime)PositionGetInteger(POSITION_TIME) >= hold * 3600)
         {
          if(g_exec[sys].Close(ticket))
-            g_bridge.Event("time_exit", "info", StringFormat("Closed #%I64u after %d hours.", ticket, InpMaxHoldHours),
+            g_bridge.Event("time_exit", "info", StringFormat("Closed #%I64u after %d hours.", ticket, hold),
                            JInt("ticket", (long)ticket));
         }
      }
@@ -272,15 +305,29 @@ void TryEntry(const int sys)
       return;
      }
 
-   ENUM_SIGNAL sig = g_signal[sys].Check();
-   if(sig == SIGNAL_NONE)
-      return;
-
-   double atr = g_signal[sys].Atr();
-   if(atr <= 0)
-      return;
-   double stop = atr * InpSlAtrMult;
-   double take = (InpTpRMult > 0) ? stop * InpTpRMult : 0;
+   double stop, take;
+   ENUM_SIGNAL sig;
+   if(sys == g_orbIdx)
+     {
+      sig = g_orb.Check();
+      if(sig == SIGNAL_NONE)
+         return;
+      stop = g_orb.StopDistance();
+      if(stop <= 0)
+         return;
+      take = (InpOrbTpR > 0) ? stop * InpOrbTpR : 0;
+     }
+   else
+     {
+      sig = g_signal[sys].Check();
+      if(sig == SIGNAL_NONE)
+         return;
+      double atr = g_signal[sys].Atr();
+      if(atr <= 0)
+         return;
+      stop = atr * InpSlAtrMult;
+      take = (InpTpRMult > 0) ? stop * InpTpRMult : 0;
+     }
    double lots = g_risk.LotsForStop(stop);
    if(lots <= 0)
      {
