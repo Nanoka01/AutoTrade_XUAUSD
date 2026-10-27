@@ -46,6 +46,7 @@ input double          InpMaxRiskPct     = 2.0;         // Highest risk allowed f
 input double          InpMaxDailyLoss   = 1.5;         // Max daily loss (%) -> stop for the day
 input double          InpMaxDrawdown    = 8.0;         // Max drawdown from peak (%) -> close all, halt
 input int             InpMaxPositions   = 1;           // Max open positions per system
+input int             InpMaxSameSide    = 0;           // Max open positions on one side, all systems together (0 = no limit)
 input int             InpMaxTradesDay   = 10;          // Max trades per day
 input int             InpMaxConsecLoss  = 4;           // Losses in a row before cooldown
 input int             InpCooldownMin    = 120;         // Cooldown minutes
@@ -229,6 +230,21 @@ int CountOpenAll()
    return n;
   }
 
+// Open positions of all our systems on one side (buy or sell).
+int CountOpenSide(const ENUM_POSITION_TYPE side)
+  {
+   int n = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || PositionGetString(POSITION_SYMBOL) != _Symbol || SystemOf(PositionGetInteger(POSITION_MAGIC)) < 0)
+         continue;
+      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == side)
+         n++;
+     }
+   return n;
+  }
+
 //+------------------------------------------------------------------+
 void OnTick()
   {
@@ -327,6 +343,13 @@ void TryEntry(const int sys)
          return;
       stop = atr * InpSlAtrMult;
       take = (InpTpRMult > 0) ? stop * InpTpRMult : 0;
+     }
+   int sameSide = CountOpenSide((sig == SIGNAL_BUY) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
+   if(InpMaxSameSide > 0 && sameSide >= InpMaxSameSide)
+     {
+      PrintFormat("System %d %s skipped: %d position(s) already open on that side (limit %d)", sys + 1,
+                  sig == SIGNAL_BUY ? "BUY" : "SELL", sameSide, InpMaxSameSide);
+      return;
      }
    double lots = g_risk.LotsForStop(stop);
    if(lots <= 0)
